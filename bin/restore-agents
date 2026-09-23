@@ -222,6 +222,19 @@ launch_session() {
     return
   fi
 
+  # CS_WINDOW_QUEUE=1：窗口空着起，命令写进队列由目标 shell 自己认领
+  # （share/claude-secure-job-claim.sh）。这样起的窗口左上角"新建标签/新建
+  # 窗口"按钮是活的；用 `-- <命令>` 起的窗口按钮和快捷键都是死的。
+  if [[ "${CS_WINDOW_QUEUE:-0}" == 1 ]]; then
+    local job_dir="${XDG_RUNTIME_DIR:-/tmp}/claude-secure/jobs" job_file
+    install -d -m 0700 "$job_dir"
+    job_file="$(mktemp "$job_dir/XXXXXXXX")"
+    printf '%s\n%s\n' "$cwd" "$shell_command" >"$job_file"
+    mv -- "$job_file" "$job_file.job"
+    ptyxis --new-window --working-directory "$cwd" --title "$title" >/dev/null 2>&1 &
+    return
+  fi
+
   ptyxis --new-window --working-directory "$cwd" --title "$title" -- bash -ic "$shell_command" >/dev/null 2>&1 &
 }
 

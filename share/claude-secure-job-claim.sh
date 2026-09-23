@@ -12,12 +12,22 @@
 # TTL（默认 120 秒）限制了这个窗口期。
 
 _cs_claim_job() {
-  local dir="${XDG_RUNTIME_DIR:-/tmp}/claude-secure/jobs"
-  local job mine cmd now ttl="${CS_JOB_TTL:-120}"
-  [[ -d "$dir" ]] || return 0
+  # 任务文件里装的是要 eval 的 shell 命令，所以队列目录本身就是信任边界。
+  # 只认 $XDG_RUNTIME_DIR：它是 logind 给本登录会话的私有目录（0700，本人所有）。
+  # 不设就什么都不做——退回 /tmp 等于让同机任意用户抢先建出 /tmp/claude-secure，
+  # 塞一个第一行写着你 $PWD 的任务进来，你的 shell 就替他执行。
+  local base="${XDG_RUNTIME_DIR:-}"
+  [[ -n "$base" ]] || return 0
+  local dir="$base/claude-secure/jobs"
+  local job mine cmd now perm ttl="${CS_JOB_TTL:-120}"
+  [[ ! -L "$dir" && -d "$dir" && -O "$dir" ]] || return 0
+  perm="$(stat -c %a "$dir" 2>/dev/null)" || return 0
+  # 组/他人可写的队列目录不认：别人能往里塞任务。
+  [[ "$perm" == 700 ]] || return 0
   now=$(date +%s)
   for job in "$dir"/*.job; do
-    [[ -f "$job" ]] || continue
+    # 同理：只认自己拥有的普通文件，不跟符号链接。
+    [[ ! -L "$job" && -f "$job" && -O "$job" ]] || continue
     # 过期的任务当作没人要：留着只会被下一个碰巧进同目录的 shell 误领。
     if (( now - $(stat -c %Y "$job" 2>/dev/null || echo "$now") > ttl )); then
       rm -f -- "$job"

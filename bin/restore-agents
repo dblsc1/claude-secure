@@ -226,13 +226,20 @@ launch_session() {
   # （share/claude-secure-job-claim.sh）。这样起的窗口左上角"新建标签/新建
   # 窗口"按钮是活的；用 `-- <命令>` 起的窗口按钮和快捷键都是死的。
   if [[ "${CS_WINDOW_QUEUE:-0}" == 1 ]]; then
-    local job_dir="${XDG_RUNTIME_DIR:-/tmp}/claude-secure/jobs" job_file
-    install -d -m 0700 "$job_dir"
-    job_file="$(mktemp "$job_dir/XXXXXXXX")"
-    printf '%s\n%s\n' "$cwd" "$shell_command" >"$job_file"
-    mv -- "$job_file" "$job_file.job"
-    ptyxis --new-window --working-directory "$cwd" --title "$title" >/dev/null 2>&1 &
-    return
+    # 队列目录必须是本登录会话私有的 $XDG_RUNTIME_DIR（0700、本人所有）：
+    # 任务文件里是会被目标 shell eval 的命令，退回 /tmp 就成了本地命令注入口。
+    local job_dir="${XDG_RUNTIME_DIR:-}" job_file
+    if [[ -z "$job_dir" ]]; then
+      printf 'CS_WINDOW_QUEUE=1 需要 XDG_RUNTIME_DIR，本次退回命令模式\n' >&2
+    else
+      job_dir="$job_dir/claude-secure/jobs"
+      install -d -m 0700 "$job_dir"
+      job_file="$(mktemp "$job_dir/XXXXXXXX")"
+      printf '%s\n%s\n' "$cwd" "$shell_command" >"$job_file"
+      mv -- "$job_file" "$job_file.job"
+      ptyxis --new-window --working-directory "$cwd" --title "$title" >/dev/null 2>&1 &
+      return
+    fi
   fi
 
   ptyxis --new-window --working-directory "$cwd" --title "$title" -- bash -ic "$shell_command" >/dev/null 2>&1 &

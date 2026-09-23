@@ -222,6 +222,32 @@ launch_session() {
     return
   fi
 
+  # 默认走队列：窗口空着起，命令写进队列由目标 shell 自己认领
+  # （share/claude-secure-job-claim.sh）。这样起的窗口左上角"新建标签/新建
+  # 窗口"按钮是活的；用 `-- <命令>` 起的窗口按钮和快捷键都是死的。
+  # CS_WINDOW_QUEUE=0 退回命令模式。
+  # 前提是 ~/.bashrc 真的 source 了认领脚本——否则窗口会空着开、一个会话都不恢复，
+  # 而且是在登录自动恢复的时候出事。所以这里实地检查，不成立就退回命令模式。
+  local claim_script="$HOME/.local/share/claude-secure/job-claim.sh"
+  if [[ "${CS_WINDOW_QUEUE:-1}" == 1 ]] \
+     && [[ -r "$claim_script" ]] \
+     && grep -qF 'job-claim.sh' "$HOME/.bashrc" 2>/dev/null; then
+    # 队列目录必须是本登录会话私有的 $XDG_RUNTIME_DIR（0700、本人所有）：
+    # 任务文件里是会被目标 shell eval 的命令，退回 /tmp 就成了本地命令注入口。
+    local job_dir="${XDG_RUNTIME_DIR:-}" job_file
+    if [[ -z "$job_dir" ]]; then
+      printf 'CS_WINDOW_QUEUE=1 需要 XDG_RUNTIME_DIR，本次退回命令模式\n' >&2
+    else
+      job_dir="$job_dir/claude-secure/jobs"
+      install -d -m 0700 "$job_dir"
+      job_file="$(mktemp "$job_dir/XXXXXXXX")"
+      printf '%s\n%s\n' "$cwd" "$shell_command" >"$job_file"
+      mv -- "$job_file" "$job_file.job"
+      ptyxis --new-window --working-directory "$cwd" --title "$title" >/dev/null 2>&1 &
+      return
+    fi
+  fi
+
   ptyxis --new-window --working-directory "$cwd" --title "$title" -- bash -ic "$shell_command" >/dev/null 2>&1 &
 }
 

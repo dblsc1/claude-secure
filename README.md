@@ -53,6 +53,13 @@ systemctl --user enable --now claude-secure-proxy.socket
 `claude-pri` / `claude-pub` 就是带身份的启动器；`claude-secure --shell` 给你一个
 沙箱内的交互 shell，调试挂载用。
 
+会话恢复要再装一个认领脚本（见下面「窗口队列」）：
+
+```sh
+install -m 0644 share/claude-secure-job-claim.sh ~/.local/share/claude-secure/job-claim.sh
+echo '[ -r "$HOME/.local/share/claude-secure/job-claim.sh" ] && . "$HOME/.local/share/claude-secure/job-claim.sh"' >> ~/.bashrc
+```
+
 ## Docker
 
 启动时问一次：
@@ -73,6 +80,20 @@ systemctl --user enable --now claude-secure-proxy.socket
 `ai-workspace save <名字>` 记下当前所有代理会话和终端窗口位置，
 `ai-workspace open <名字>` 原样开回来（窗口位置依赖一个 GNOME 扩展，
 用 `CS_LAYOUT_DBUS_NAME` 指定它的 DBus 名；没装就只恢复会话）。
+
+### 窗口队列
+
+Ptyxis 用 `-- <命令>` 起的窗口，左上角"新建标签/新建窗口"的按钮和对应快捷键
+都是死的——VTE 认为这个窗口属于那条命令，不属于 shell。所以恢复会话时窗口
+**空着起**，命令写进 `$XDG_RUNTIME_DIR/claude-secure/jobs`，由目标 shell 启动时
+按 `$PWD` 认领（rename 抢占，默认 120 秒 TTL）。这是默认行为，
+`CS_WINDOW_QUEUE=0` 退回命令模式；`~/.bashrc` 里没有那行 source 时也会自动退回。
+
+任务文件里装的是会被 `eval` 的 shell 命令，所以队列目录就是信任边界：只认
+`$XDG_RUNTIME_DIR` 下自己拥有的 0700 目录，不设这个变量就不认领——退回 `/tmp`
+等于让同机任意用户塞任务进来。
+
+代价：恢复期间你自己在同一个目录手动开的终端，可能替它把任务领走。
 
 ## 推送闸门（可选）
 

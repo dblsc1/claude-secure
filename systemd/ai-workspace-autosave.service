@@ -1,0 +1,8 @@
+[Unit]
+Description=Autosave Codex/Claude sessions and Ptyxis layout to workspace 「上次关机前」
+# 只在图形会话里有意义：capture 读 ~/.claude/sessions*，layout Save 走 GNOME Shell DBus。
+After=graphical-session.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/ai-workspace autosave

@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# 把"指名提交 cherry-pick 到公开仓"身份。独立 home、独立公开 PAT、
+# 推送闸门（只读挂载替身 git，见 claude-secure-push-gate）。
+# CLAUDE_PUB_BUSINESS_TERMS 必须指向商业术语清单文件，缺失时闸门直接拒绝放行
+# （需求文档 §9 open question 1 的默认取向：缺失即拒，不取宽松默认）。
+exec env CLAUDE_SECURE_IDENTITY=pub "$(dirname "$(readlink -f "$0")")/claude-secure" "$@"

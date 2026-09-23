@@ -1,0 +1,241 @@
+#!/usr/bin/env bash
+# 手动保存、恢复多个 Codex / Claude 工作区。
+set -euo pipefail
+
+root_dir="${XDG_CONFIG_HOME:-$HOME/.config}/agent-workspace"
+profiles_dir="$root_dir/workspaces"
+default_file="$root_dir/default-workspace"
+restore_script="$HOME/.local/bin/restore-agents"
+# 定时自动保存用的固定工作区名。systemd user timer ai-workspace-autosave.timer
+# 每 5 分钟跑一次 `ai-workspace autosave`；开机时面板（--startup）把它单独
+# 列出来供选择。面板 ai-workspace-panel 里的 AUTOSAVE_PROFILE 必须与此一致。
+autosave_profile="上次关机前"
+# 定时器实际写入的是滚动工作区「自动保存」；每次开机后第一次运行（autosave 或
+# open）先把「自动保存」整份转存为「上次关机前」，再继续。这样登录后的定时保存
+# 不会把关机前的快照覆盖掉（2026-09-16 就是这样丢过一次）。开机标记放在
+# XDG_RUNTIME_DIR，注销/关机即清空；gnome-shell 崩溃后重登录不算新开机。
+autosave_rolling_profile="自动保存"
+boot_marker="${XDG_RUNTIME_DIR:-/tmp}/agent-workspace/boot-rotated"
+# GNOME 窗口布局扩展的 DBus 名。扩展不在本仓里；名字跟你装的那个对齐。
+dbus_name="${CS_LAYOUT_DBUS_NAME:-io.github.agentworkspace.Layout}"
+dbus_path="/${dbus_name//.//}"
+dbus_interface="$dbus_name"
+
+usage() {
+  cat <<'EOF'
+用法：ai-workspace <命令> [工作区名]
+
+save <名称>          手动保存当前 Codex/Claude 会话及 Ptyxis 窗口布局，并设为默认
+open <名称>          打开指定工作区并恢复已保存的窗口位置、大小、显示器和 GNOME 工作区
+open-default         打开默认工作区（用于登录自动恢复）
+autosave             定时器调用：滚动保存到「自动保存」；开机后首次运行先转存为「上次关机前」
+open-apps            让 AWSM 扩展恢复上次的其他应用窗口（Chrome、文件管理器等），不含终端
+set-default <名称>   选择下次登录自动打开的工作区
+list                 显示所有工作区和默认项
+help                 显示本说明
+
+示例：
+  ai-workspace save cfo
+  ai-workspace save ecs
+  ai-workspace open cfo
+  ai-workspace set-default ecs
+EOF
+}
+
+die() {
+  printf '错误：%s\n' "$*" >&2
+  exit 1
+}
+
+valid_profile() {
+  local profile="$1"
+  [[ -n "$profile" && "$profile" != . && "$profile" != .. && "$profile" != */* ]]
+}
+
+profile_dir() {
+  valid_profile "$1" || die '工作区名称不能为空，且不能包含 /。'
+  printf '%s/%s\n' "$profiles_dir" "$1"
+}
+
+profile_agents_file() {
+  printf '%s/agents.tsv\n' "$(profile_dir "$1")"
+}
+
+agent_count() {
+  local file="$1"
+  awk -F '\t' '!/^#/ && NF >= 4 { count += 1 } END { print count + 0 }' "$file" 2>/dev/null || true
+}
+
+layout_call() {
+  local method="$1" profile="$2" output
+  command -v gdbus >/dev/null || die '未找到 gdbus，无法与 GNOME 窗口布局扩展通信。'
+  if ! output="$(gdbus call --session --dest "$dbus_name" --object-path "$dbus_path" \
+    --method "$dbus_interface.$method" "$profile" 2>&1)"; then
+    die "窗口布局扩展调用失败：$output"
+  fi
+  printf '%s\n' "$output"
+}
+
+# 登录自动恢复时 autostart 与 gnome-shell 加载扩展几乎同时发生（2026-09-09
+# 日志里两者同一秒），扩展的 DBus 名字往往还没注册。之前直接 die，导致一个
+# 会话都不开。这里最多等 timeout 秒；等不到返回 1，由调用方降级处理。
+layout_wait_ready() {
+  local timeout="${1:-30}" waited=0
+  command -v gdbus >/dev/null || return 1
+  while (( waited < timeout )); do
+    if gdbus call --session --dest org.freedesktop.DBus --object-path /org/freedesktop/DBus \
+        --method org.freedesktop.DBus.NameHasOwner "$dbus_name" 2>/dev/null | grep -q true; then
+      return 0
+    fi
+    sleep 1
+    ((waited += 1))
+  done
+  return 1
+}
+
+write_default() {
+  mkdir -p "$root_dir"
+  local tmp_file
+  tmp_file="$(mktemp "$root_dir/default-workspace.XXXXXX")"
+  printf '%s\n' "$1" >"$tmp_file"
+  mv "$tmp_file" "$default_file"
+}
+
+save_workspace() {
+  local profile="$1" profile_path agents_file count
+  profile_path="$(profile_dir "$profile")"
+  agents_file="$profile_path/agents.tsv"
+  mkdir -p "$profile_path"
+
+  AGENT_WORKSPACE_CONFIG_FILE="$agents_file" "$restore_script" --capture
+  count="$(agent_count "$agents_file")"
+  ((count > 0)) || die '未发现可保存的 Codex/Claude 会话。请先打开并登录代理。'
+
+  # 布局扩展不可用（被停用、未加载）时不中止：会话列表已经写好，只是少了
+  # 窗口位置。2026-09-15 用户在面板里保存一直"操作未完成"，就是因为 GNOME 的
+  # disable-user-extensions 被打开、扩展停用，这里 die 把整个保存标成失败。
+  local layout_note=''
+  if layout_wait_ready 5; then
+    layout_call Save "$profile" >/dev/null
+  else
+    layout_note="（警告：窗口布局扩展 $dbus_name 不可用，本次未保存窗口位置；检查 gsettings get org.gnome.shell disable-user-extensions 是否为 true）"
+    printf '警告：窗口布局扩展不可用，只保存了会话列表。\n' >&2
+  fi
+  write_default "$profile"
+  printf '已保存工作区「%s」：%d 个会话；它将于下次登录自动恢复。%s\n' "$profile" "$count" "$layout_note"
+}
+
+# 非终端应用（Chrome、Nautilus、系统监视器…）的窗口恢复交给 another-window-
+# session-manager（AWSM）扩展：它持续把所有窗口记到
+# ~/.config/another-window-session-manager/currentSession/，并在 DBus 上提供
+# RestorePreviousSession。这里只是喊它一声。前提：
+#   1) gsettings enable-restore-previous-session=true（已设）；
+#   2) AWSM 的 openWindowsTracker.js 黑名单里有 org.gnome.Ptyxis，
+#      否则它会把终端也开成空 shell，和本脚本重复。
+# 已知限制：Nautilus 只能回到原位置，打不开原文件夹（AWSM 不记路径）。
+awsm_dest="org.gnome.Shell.Extensions.awsm"
+awsm_path="/org/gnome/Shell/Extensions/awsm"
+open_apps() {
+  command -v gdbus >/dev/null || die '未找到 gdbus。'
+  local output
+  if ! output="$(gdbus call --session --dest "$awsm_dest" --object-path "$awsm_path" \
+      --method "$awsm_dest.Autostart.RestorePreviousSession" "{'removeAfterRestore': <false>}" 2>&1)"; then
+    die "AWSM 扩展调用失败（未启用或未加载？）：$output"
+  fi
+  case "$output" in
+    *ERROR*|*disabled*) die "AWSM 拒绝恢复：$output" ;;
+  esac
+  printf '已请求 AWSM 恢复其他应用窗口：%s\n' "$output"
+}
+
+# 与 save 的区别：无会话时静默退出（不覆盖上次结果、不报错，定时器日志干净）；
+# 不改默认工作区；布局扩展没就绪就只存会话列表。
+rotate_autosave_on_boot() {
+  [[ -e "$boot_marker" ]] && return 0
+  mkdir -p "$(dirname "$boot_marker")"
+  local src="$profiles_dir/$autosave_rolling_profile" dst="$profiles_dir/$autosave_profile"
+  if [[ -f "$src/agents.tsv" ]]; then
+    rm -rf -- "$dst.tmp" && cp -a -- "$src" "$dst.tmp" && rm -rf -- "$dst" && mv -- "$dst.tmp" "$dst"
+    printf '开机首次：已把「%s」转存为「%s」。\n' "$autosave_rolling_profile" "$autosave_profile" >&2
+  fi
+  touch "$boot_marker"
+}
+
+autosave_workspace() {
+  rotate_autosave_on_boot
+  local profile="$autosave_rolling_profile" profile_path agents_file count
+  profile_path="$(profile_dir "$profile")"
+  agents_file="$profile_path/agents.tsv"
+  mkdir -p "$profile_path"
+
+  AGENT_WORKSPACE_CONFIG_FILE="$agents_file" "$restore_script" --capture-quiet
+  count="$(agent_count "$agents_file")"
+  if ((count == 0)); then
+    printf '自动保存：当前没有运行中的 Codex/Claude 会话，保留上次结果。\n' >&2
+    return 0
+  fi
+  if layout_wait_ready 5; then
+    layout_call Save "$profile" >/dev/null
+  else
+    printf '自动保存：窗口布局扩展未就绪，本次只保存会话列表。\n' >&2
+  fi
+  printf '自动保存「%s」：%d 个会话。\n' "$profile" "$count"
+}
+
+open_workspace() {
+  rotate_autosave_on_boot
+  local profile="$1" agents_file
+  local layout_file="$(profile_dir "$profile")/layout.json"
+  agents_file="$(profile_agents_file "$profile")"
+  [[ -f "$agents_file" ]] || die "找不到工作区「$profile」。运行 ai-workspace list 查看可用项。"
+  (( $(agent_count "$agents_file") > 0 )) || die "工作区「$profile」没有已保存的会话。"
+
+  # 先让 GNOME Shell 进入等待匹配状态，再启动终端窗口。
+  # 布局扩展不可用时不能中止：窗口位置只是锦上添花，会话本身必须开出来。
+  if [[ -f "$layout_file" ]]; then
+    if layout_wait_ready 30; then
+      layout_call Prepare "$profile" >/dev/null
+    else
+      printf '警告：窗口布局扩展 %s 30 秒内未就绪；本次只恢复会话，不恢复窗口位置。\n' "$dbus_name" >&2
+    fi
+  else
+    printf '工作区「%s」尚未保存窗口位置；本次将使用 GNOME 默认位置。\n' "$profile" >&2
+  fi
+  AGENT_WORKSPACE_CONFIG_FILE="$agents_file" "$restore_script" --force
+  printf '正在恢复工作区「%s」。窗口在启动后的几秒内会回到保存的位置。\n' "$profile"
+}
+
+open_default() {
+  [[ -r "$default_file" ]] || die '尚未设置默认工作区。先运行：ai-workspace save <名称>'
+  local profile
+  profile="$(head -n 1 "$default_file")"
+  open_workspace "$profile"
+}
+
+list_workspaces() {
+  local default_profile='（未设置）'
+  [[ -r "$default_file" ]] && default_profile="$(head -n 1 "$default_file")"
+  printf '默认工作区：%s\n' "$default_profile"
+  if [[ ! -d "$profiles_dir" ]] || ! find "$profiles_dir" -mindepth 1 -maxdepth 1 -type d -print -quit | grep -q .; then
+    printf '尚未保存任何工作区。\n'
+    return
+  fi
+  local dir name count
+  while IFS= read -r dir; do
+    name="${dir##*/}"
+    count="$(agent_count "$dir/agents.tsv")"
+    printf '%s\t%s 个会话%s\n' "$name" "$count" "$([[ "$name" == "$default_profile" ]] && printf '  ← 默认')"
+  done < <(find "$profiles_dir" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort | sed "s#^#$profiles_dir/#")
+}
+
+case "${1:-help}" in
+  save) [[ $# == 2 ]] || die '用法：ai-workspace save <名称>'; save_workspace "$2" ;;
+  open) [[ $# == 2 ]] || die '用法：ai-workspace open <名称>'; open_workspace "$2" ;;
+  open-default) [[ $# == 1 ]] || die 'open-default 不接受参数'; open_default ;;
+  autosave) [[ $# == 1 ]] || die 'autosave 不接受参数'; autosave_workspace ;;
+  open-apps) [[ $# == 1 ]] || die 'open-apps 不接受参数'; open_apps ;;
+  set-default) [[ $# == 2 ]] || die '用法：ai-workspace set-default <名称>'; [[ -f "$(profile_agents_file "$2")" ]] || die "找不到工作区「$2」。"; write_default "$2"; printf '默认工作区已设为「%s」。\n' "$2" ;;
+  list) [[ $# == 1 ]] || die 'list 不接受参数'; list_workspaces ;;
+  help|-h|--help) usage ;;
+  *) usage; exit 2 ;;
+esac

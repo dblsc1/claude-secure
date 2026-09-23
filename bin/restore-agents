@@ -1,0 +1,282 @@
+#!/usr/bin/env bash
+# 一键恢复已登记的 Codex 与 Claude Code 会话。
+set -euo pipefail
+
+CS_CONFIG="${CLAUDE_SECURE_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/claude-secure/config.env}"
+# shellcheck source=/dev/null
+[[ -r "$CS_CONFIG" ]] && . "$CS_CONFIG"
+cs_workspace="${CS_WORKSPACE:-$HOME/workspace}"
+cs_pub_dir="${CS_PUB_DIR:-public-work}"
+
+config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/agent-workspace"
+config_file="${AGENT_WORKSPACE_CONFIG_FILE:-$config_dir/agents.tsv}"
+runtime_dir="${XDG_RUNTIME_DIR:-/tmp}/agent-workspace"
+restore_marker="$runtime_dir/restored"
+
+usage() {
+  cat <<'EOF'
+用法：restore-agents [命令]
+
+不带参数              打开所有已登记的 AI 会话
+--dry-run              只显示将要打开的会话，不执行
+--force                即使本次登录已恢复过，也再次打开
+--capture              用当前运行中的 Codex/Claude 精确会话更新登记列表
+--list                 显示已登记的会话
+--enable-autostart     登录 GNOME 后自动恢复（会启动所有窗口）
+--disable-autostart    关闭登录后自动恢复
+--help                 显示本说明
+
+提示：项目或会话变动后，在关机前执行一次 `restore-agents --capture`。
+EOF
+}
+
+die() {
+  printf '错误：%s\n' "$*" >&2
+  exit 1
+}
+
+clean_field() {
+  tr '\t\r\n' '   ' <<<"$1"
+}
+
+ensure_dependencies() {
+  command -v ptyxis >/dev/null || die '未找到 Ptyxis 终端。'
+  command -v codex >/dev/null || die '未找到 codex 命令。'
+  command -v claude >/dev/null || die '未找到 claude 命令。'
+}
+
+list_sessions() {
+  [[ -f "$config_file" ]] || die "找不到配置：$config_file"
+  awk -F '\t' '
+    /^#/ || NF == 0 { next }
+    { printf "%-11s  %-34s  %s\n", $1, $2, $3 }
+  ' "$config_file"
+}
+
+capture_sessions() {
+  local quiet="$1"
+  command -v jq >/dev/null || die '未找到 jq，无法读取本地会话元数据。'
+  mkdir -p "$config_dir"
+  local tmp_file
+  tmp_file="$(mktemp "$config_dir/agents.tsv.XXXXXX")"
+  trap 'rm -f "$tmp_file"' RETURN
+
+  local captured=0
+  {
+    printf '# agent\ttitle\tworking_directory\tsession_id\n'
+    printf '# 此文件由 restore-agents --capture 生成；字段请使用制表符分隔。\n'
+
+    local target session_id cwd title meta
+    # 沙箱内的进程宿主其实看得见，但它的 PID 与命名空间内 PID 不同，
+    # 对不上会话文件名，所以不靠 pgrep/proc。改成扫最近写过的 rollout
+    # 文件——只有正在运行的会话才会持续更新它。
+    while IFS= read -r target; do
+      meta="$(head -n 1 "$target" 2>/dev/null || true)"
+      session_id="$(jq -r 'select(.type == "session_meta" and .payload.source == "cli") | .payload.id // empty' <<<"$meta" 2>/dev/null || true)"
+      [[ "$session_id" =~ ^[0-9a-f-]{36}$ ]] || continue
+      cwd="$(jq -r '.payload.cwd // empty' <<<"$meta" 2>/dev/null || true)"
+      [[ -n "$cwd" && -d "$cwd" ]] || continue
+      title="Codex — ${cwd##*/}"
+      printf 'codex\t%s\t%s\t%s\n' "$(clean_field "$title")" "$cwd" "$session_id"
+      ((captured += 1))
+    done < <(find "$HOME/.codex/sessions" -name 'rollout-*.jsonl' -mmin -60 2>/dev/null)
+
+    # 存活判定：会话记录的 pidDomain 形如 linux:<machine-id>:pid:[<inode>]，
+    # 其中 inode 是该进程 PID 命名空间的 inode，宿主 /proc/<pid>/ns/pid 能读到。
+    # 沙箱记录靠它判活（沙箱内 pid 永远是 2，没法直接 kill -0）；宿主记录
+    # 直接 kill -0 <pid>。为什么必须判活：claude-secure 的 EXIT trap 在注销
+    # （systemd 先 TERM 后 KILL）或窗口被硬杀时不会执行，sessions-sandbox 下
+    # 会留下带 2.json 的死目录；只看 mtime 会把它们当活会话登记进去，
+    # 结果 4 个窗口存出 10 条（2026-09-11 复现）。
+    local live_pid_ns
+    live_pid_ns="$(
+      for ns in /proc/[0-9]*/ns/pid; do readlink "$ns" 2>/dev/null; done | sort -u
+    )"
+    record_alive() {
+      local file="$1" domain pid ns
+      domain="$(jq -r '.pidDomain // empty' "$file" 2>/dev/null || true)"
+      pid="$(jq -r '.pid // empty' "$file" 2>/dev/null || true)"
+      case "$file" in
+        /proc/[0-9]*/root/*) return 0 ;;   # 进程存在即活着
+        "$HOME/.claude/sessions-sandbox/"*)
+          ns="${domain##*:pid:}"
+          [[ -n "$ns" && "$ns" != "$domain" ]] || return 1
+          grep -qxF "pid:$ns" <<<"$live_pid_ns"
+          ;;
+        *)
+          [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null
+          ;;
+      esac
+    }
+
+    # Claude Code 把当前会话状态写进 ~/.claude/sessions/<pid>.json，不用看进程。
+    # 注意：claude-secure 沙箱里 claude 永远是 PID 2，若所有沙箱共享宿主的
+    # sessions 目录就会互相覆盖 2.json，只剩 1 条。所以 claude-secure 给每个
+    # 沙箱单独绑一个 ~/.claude/sessions-sandbox/<随机>/ 目录，这里两层都要扫：
+    #   ~/.claude/sessions/*.json            —— 宿主直接跑的 claude-host
+    #   ~/.claude/sessions-sandbox/*/*.json  —— 每个 claude-secure 沙箱各一个
+    # 改动 claude-secure 的绑定路径时必须同步改这里。
+    local -A seen_claude=()
+    while IFS= read -r state_file; do
+      [[ -r "$state_file" ]] || continue
+      record_alive "$state_file" || continue
+      # 启动器识别：宿主 ~/.claude/sessions 下的是 claude-host；沙箱目录里由
+      # claude-secure 写的 .launcher 给出 claude-pri / claude-pub（/proc/<pid>/root
+      # 路径下同样能读到）；没有 .launcher 的旧沙箱记为 claude（= 默认沙箱身份）。
+      case "$state_file" in
+        "$HOME/.claude/sessions/"*) launcher=claude-host ;;
+        *) launcher_file="$(dirname "$state_file")/.launcher"; launcher=''
+           [[ -f "$launcher_file" ]] && launcher="$(tr -d '[:space:]' <"$launcher_file" 2>/dev/null || true)"
+           [[ "$launcher" =~ ^claude-(pri|pub)$ ]] || launcher=claude ;;
+      esac
+      session_id="$(jq -r '.sessionId // empty' "$state_file" 2>/dev/null || true)"
+      # 同一 session 不重复登记（理论上不该出现，防御一下）。
+      [[ -n "${seen_claude[$session_id]:-}" ]] && continue
+      seen_claude[$session_id]=1
+      cwd="$(jq -r '.cwd // empty' "$state_file" 2>/dev/null || true)"
+      title="$(jq -r '.name // empty' "$state_file" 2>/dev/null || true)"
+      [[ "$session_id" =~ ^[0-9a-f-]{36}$ && -d "$cwd" ]] || continue
+      [[ -n "$title" ]] || title="Claude — ${cwd##*/}"
+      printf '%s\t%s\t%s\t%s\n' "$launcher" "$(clean_field "$title")" "$cwd" "$session_id"
+      ((captured += 1))
+    done < <(
+      # 不再按 mtime 过滤：空闲超过 1 小时的 claude 不更新状态文件，会被漏掉。
+      # 活没活由上面的 record_alive 判定。
+      find "$HOME/.claude/sessions" -maxdepth 1 -name '*.json' 2>/dev/null
+      find "$HOME/.claude/sessions-sandbox" -mindepth 2 -maxdepth 2 -name '*.json' 2>/dev/null
+      # 兜底：直接透过宿主 /proc/<pid>/root 读每个运行中的沙箱 claude 自己看到的
+      # ~/.claude/sessions/。即使它的记录目录在宿主上被误删（2026-09-14 出过），
+      # 这条路仍然读得到；进程在就等于活着，不需要再判活。
+      for pid in $(pgrep -f '^/opt/claude/claude' 2>/dev/null); do
+        find "/proc/$pid/root$HOME/.claude/sessions" -maxdepth 1 -name '*.json' 2>/dev/null
+      done
+    )
+  } >"$tmp_file"
+
+  # 关机时终端可能已先退出；绝不能用空结果覆盖上一次可恢复的清单。
+  if ((captured == 0)); then
+    trap - RETURN
+    rm -f "$tmp_file"
+    [[ "$quiet" == true ]] || printf '未发现运行中的 Codex/Claude，保留原有清单。\n' >&2
+    return 0
+  fi
+
+  mv "$tmp_file" "$config_file"
+  trap - RETURN
+  if [[ "$quiet" != true ]]; then
+    printf '已登记：\n'
+    list_sessions
+  fi
+}
+
+launch_session() {
+  local agent="$1" title="$2" cwd="$3" session_id="$4" dry_run="$5"
+  [[ -d "$cwd" ]] || { printf '跳过（目录不存在）：%s\n' "$cwd" >&2; return; }
+
+  # 沙箱身份只能看到自己挂载范围内的目录（claude-pri/claude：$cs_workspace；
+  # claude-pub：$cs_workspace/$cs_pub_dir）。范围外的 cwd 会被 claude-secure
+  # 静默改成 $cs_workspace，--resume 于是找不到会话、新开一个按目录名自动命名
+  # 的空会话（窗口标题变成"<目录名>-6c"这种就是这么来的）。改派 claude-host，
+  # 它在宿主上跑，什么目录都看得到。范围判断要跟 claude-secure 里的保持同步。
+  case "$agent" in
+    claude|claude-pri)
+      case "$cwd" in "$cs_workspace"|"$cs_workspace"/*) ;;
+        *) printf '%s 在 %s 的挂载范围外，改用 claude-host 恢复\n' "$cwd" "$agent" >&2
+           agent=claude-host ;;
+      esac ;;
+    claude-pub)
+      case "$cwd" in "$cs_workspace/$cs_pub_dir"|"$cs_workspace/$cs_pub_dir"/*) ;;
+        *) printf '%s 在 claude-pub 的挂载范围外，改用 claude-host 恢复\n' "$cwd" >&2
+           agent=claude-host ;;
+      esac ;;
+  esac
+
+  local -a agent_command
+  case "$agent" in
+    codex) agent_command=(codex resume "$session_id") ;;
+    # claude 与 claude-host 是 ~/.bashrc 里的函数，claude-pri/claude-pub 是
+    # ~/.local/bin 下的脚本；都通过 bash -ic 解析，所以直接用登记的名字当命令。
+    claude|claude-pri|claude-pub|claude-host) agent_command=("$agent" --resume "$session_id") ;;
+    *) printf '跳过（未知代理类型）：%s\n' "$agent" >&2; return ;;
+  esac
+
+  # 不加 exec：~/.bashrc 里 claude 是个函数（转到 claude-secure 沙箱），
+  # exec 只查 PATH、绕过函数，会直接跑宿主裸二进制 ~/.local/bin/claude，
+  # 恢复出来的会话就没进沙箱（2026-09-09 发现）。用 bash -ic 让函数生效。
+  # 恢复窗口里问不了 docker 模式（ptyxis 是单实例 GApplication，--new-window 只是
+  # 把命令交给已运行的服务进程，菜单没地方弹，启动器自己的环境变量也到不了新
+  # shell），所以模式必须写进命令串。取值来自 ~/.config/claude-secure/docker-mode，
+  # 文件不存在就 none —— 以前这里写死 none，于是无论开机菜单选什么，恢复出来的
+  # 会话一律没有 docker。
+  local docker_mode
+  docker_mode="$(cat "${XDG_CONFIG_HOME:-$HOME/.config}/claude-secure/docker-mode" 2>/dev/null || true)"
+  case "$docker_mode" in full|rootless|none) ;; *) docker_mode=none ;; esac
+  local shell_command="CLAUDE_SECURE_DOCKER_MODE=$docker_mode "
+  local part
+  for part in "${agent_command[@]}"; do
+    printf -v shell_command '%s%q ' "$shell_command" "$part"
+  done
+
+  if [[ "$dry_run" == true ]]; then
+    printf '%-11s %-34s %s\n' "$agent" "$title" "$cwd"
+    return
+  fi
+
+  ptyxis --new-window --working-directory "$cwd" --title "$title" -- bash -ic "$shell_command" >/dev/null 2>&1 &
+}
+
+restore_sessions() {
+  local dry_run="$1" force="$2"
+  ensure_dependencies
+  [[ -f "$config_file" ]] || die "找不到配置：$config_file（先运行 restore-agents --capture）"
+
+  mkdir -p "$runtime_dir"
+  if [[ -e "$restore_marker" && "$force" != true && "$dry_run" != true ]]; then
+    die '本次登录已经恢复过。若确实需要重复打开，请运行 restore-agents --force。'
+  fi
+
+  local agent title cwd session_id extra count=0
+  while IFS=$'\t' read -r agent title cwd session_id extra; do
+    [[ -z "$agent" || "$agent" == \#* ]] && continue
+    [[ -z "$title" || -z "$cwd" || -z "$session_id" || -n "$extra" ]] && {
+      printf '跳过格式错误的配置行：%s\n' "$agent" >&2
+      continue
+    }
+    launch_session "$agent" "$title" "$cwd" "$session_id" "$dry_run"
+    sleep 0.5
+    ((count += 1))
+  done <"$config_file"
+
+  ((count > 0)) || die '配置中没有可恢复的会话。'
+  if [[ "$dry_run" != true ]]; then
+    touch "$restore_marker"
+    printf '已请求打开 %d 个会话。\n' "$count"
+  fi
+}
+
+set_autostart() {
+  local mode="$1"
+  local autostart_dir="${XDG_CONFIG_HOME:-$HOME/.config}/autostart"
+  local autostart_file="$autostart_dir/restore-ai-agents.desktop"
+  if [[ "$mode" == enable ]]; then
+    mkdir -p "$autostart_dir"
+    cp "$HOME/.local/share/applications/restore-ai-agents.desktop" "$autostart_file"
+    printf '已启用：下次登录 GNOME 时会自动恢复会话。\n'
+  else
+    rm -f "$autostart_file"
+    printf '已关闭登录后自动恢复。\n'
+  fi
+}
+
+case "${1:-start}" in
+  start) restore_sessions false false ;;
+  --dry-run) restore_sessions true false ;;
+  --force) restore_sessions false true ;;
+  --capture) capture_sessions false ;;
+  --capture-quiet) capture_sessions true ;;
+  --list) list_sessions ;;
+  --enable-autostart) set_autostart enable ;;
+  --disable-autostart) set_autostart disable ;;
+  -h|--help) usage ;;
+  *) usage; exit 2 ;;
+esac

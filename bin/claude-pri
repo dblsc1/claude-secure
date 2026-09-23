@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# claude-secure 的默认身份，写出来只为显式起名——本身等价于
+# CLAUDE_SECURE_IDENTITY=pri claude-secure "$@"。
+exec env CLAUDE_SECURE_IDENTITY=pri "$(dirname "$(readlink -f "$0")")/claude-secure" "$@"

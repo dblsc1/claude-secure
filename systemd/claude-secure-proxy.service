@@ -1,0 +1,7 @@
+[Unit]
+Description=Claude Secure Mihomo Socket Proxy
+Requires=claude-secure-proxy.socket
+After=claude-secure-proxy.socket mihomo.service
+
+[Service]
+ExecStart=/usr/lib/systemd/systemd-socket-proxyd 127.0.0.1:7893

@@ -1,0 +1,11 @@
+[Unit]
+Description=Every 5 minutes: ai-workspace autosave
+
+[Timer]
+# 登录后 3 分钟首次运行（等窗口都恢复/打开完），之后每 5 分钟一次。
+OnStartupSec=3min
+OnUnitActiveSec=5min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

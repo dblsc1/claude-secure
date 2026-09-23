@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# claude-host（沙箱外、全权身份）的公开仓推送确认闸。
+# 需求文档 §4：claude-host 也要过同一道闸——威胁模型是自己手滑，不是恶意，
+# 所以这里不是阻止令牌越权（host 本来就全权），是逼一次人工"确认要往外发"。
+# 没有 tty 读不到确认 = 拒绝放行，不是静默通过（stdin 在 hook 里已被 JSON
+# payload 占用，必须 exec < /dev/tty 才能读键盘，同 claude-secure-push-gate）。
+set -euo pipefail
+
+CS_CONFIG="${CLAUDE_SECURE_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/claude-secure/config.env}"
+# shellcheck source=/dev/null
+[[ -r "$CS_CONFIG" ]] && . "$CS_CONFIG"
+read -r -a PUBLIC_REPOS <<<"${CS_PUBLIC_REPOS:-}"
+readonly PUBLIC_REPOS
+
+payload=$(cat 2>/dev/null || true)
+cmd=$(printf '%s' "$payload" | jq -r '.tool_input.command // empty' 2>/dev/null || true)
+cwd=$(printf '%s' "$payload" | jq -r '.cwd // empty' 2>/dev/null || true)
+[[ -n "$cmd" ]] || exit 0
+[[ -n "$cwd" ]] || cwd=.
+
+target=""
+
+if grep -qE '(^|[;&|[:space:]])git[[:space:]]+push([[:space:]]|$)' <<<"$cmd"; then
+  # 跳过 -u / --force-with-lease 等选项，取 push 后第一个非选项词当 remote；
+  # 撞上 && ; | 就停。解析不出 URL 时退回 origin，不能因为解析失败就放行。
+  after_push=${cmd#*git push}
+  remote=""
+  set -f
+  for tok in $after_push; do
+    case "$tok" in
+      -*) continue ;;
+      '&&'|'||'|';'|'|') break ;;
+      *) remote=$tok; break ;;
+    esac
+  done
+  set +f
+  [[ -n "$remote" ]] || remote=origin
+  url=$(git -C "$cwd" remote get-url "$remote" 2>/dev/null || true)
+  [[ -n "$url" ]] || url=$(git -C "$cwd" remote get-url origin 2>/dev/null || true)
+  target=$(sed -E 's#^(https://github\.com/|git@github\.com:)##; s#\.git$##' <<<"$url")
+fi
+
+
+[[ -n "$target" ]] || exit 0
+
+public=0
+for r in "${PUBLIC_REPOS[@]}"; do
+  [[ "$target" == "$r" ]] && { public=1; break; }
+done
+(( public )) || exit 0
+
+deny() { printf '❌ claude-host 公开仓推送确认闸：%s\n' "$1" >&2; exit 2; }
+
+exec < /dev/tty 2>/dev/null || deny "无 tty，无人值守场景不允许自动通过（需求文档 §4）"
+printf '\n即将对公开仓 %s 执行：\n  %s\n' "$target" "$cmd" >&2
+read -r -p '确认继续？[yes/no]: ' ans
+[[ "$ans" == yes ]] || deny "人工未核准"
+exit 0

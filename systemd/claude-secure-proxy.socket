@@ -1,0 +1,11 @@
+[Unit]
+Description=Private proxy bridge socket for Claude Secure
+
+[Socket]
+ListenStream=%t/claude-secure/mihomo.sock
+SocketMode=0600
+DirectoryMode=0700
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target

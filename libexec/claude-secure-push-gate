@@ -1,0 +1,138 @@
+#!/usr/bin/env bash
+# Drop-in `git` replacement for the claude-pub sandbox identity.
+#
+# Ro-bind mounted ahead of the real git on PATH, so it is not a git hook
+# (`--no-verify` disables hooks, it has no effect on which binary "git"
+# resolves to) and cannot be edited or deleted by sandboxed code (read-only
+# mount, outside the repo it operates on).
+#
+# Every subcommand except `push` passes straight through. `push` must clear
+# every check below or the real push never runs. See
+# security/沙箱与凭据隔离-需求文档.md §3 for the requirements this implements.
+set -euo pipefail
+
+readonly REAL_GIT=/usr/bin/git
+# 白名单由启动器经 --setenv CS_PUBLIC_REPOS 传进沙箱（空格分隔的 owner/repo）。
+# 传不进来就是空清单，任何仓都推不动——缺配置即拒，不取宽松默认。
+read -r -a PUBLIC_REPOS <<<"${CS_PUBLIC_REPOS:-}"
+readonly PUBLIC_REPOS
+# 允许改动的路径前缀，来自 CS_ALLOW_PATHS（空格分隔），同样是保留清单。
+# 已经公开的文件放进来没有安全损失；.github/ 建议永远不放——workflow 是会在 CI
+# 里执行的文件，而且细粒度 PAT 通常没有 Workflows 权限，放行了 GitHub 也会 403，
+# 不如在闸门这里明确报错。
+read -r -a ALLOW_PATHS <<<"${CS_ALLOW_PATHS:-docs README.md LICENSE}"
+readonly ALLOW_PATHS
+readonly MAX_COMMITS=20
+# 正本在私有目录里，pub 看不到那个目录，由启动器单文件 ro-bind 到这里。
+readonly SCAN_SCRIPT="${CLAUDE_PUB_SCAN_SCRIPT:-/opt/claude/scan-before-push.sh}"
+readonly TERMS_FILE="${CLAUDE_PUB_BUSINESS_TERMS:-}"
+
+orig_args=("$@")
+
+reject() {
+  printf '推送闸门拒绝：%s\n' "$*" >&2
+  exit 1
+}
+
+if [[ "${1:-}" != push ]]; then
+  exec "$REAL_GIT" "${orig_args[@]}"
+fi
+shift
+
+remote=origin
+refspec=""
+remote_set=0
+for a in "$@"; do
+  case "$a" in
+    -*) continue ;;
+    *)
+      if [[ "$remote_set" == 0 ]]; then remote="$a"; remote_set=1;
+      elif [[ -z "$refspec" ]]; then refspec="$a"; fi
+      ;;
+  esac
+done
+
+if [[ "$refspec" == *:* ]]; then
+  remote_branch="${refspec#*:}"
+else
+  remote_branch="$refspec"
+fi
+[[ -n "$remote_branch" ]] || remote_branch="$("$REAL_GIT" symbolic-ref --short HEAD 2>/dev/null || true)"
+[[ -n "$remote_branch" ]] || reject "无法确定目标分支"
+
+case "$remote_branch" in
+  main|master) reject "目标分支 $remote_branch 是受保护分支，只允许推特性分支，合并由人类在 GitHub 上做" ;;
+esac
+
+remote_url="$("$REAL_GIT" remote get-url "$remote" 2>/dev/null || true)"
+[[ -n "$remote_url" ]] || reject "无法解析 remote $remote 的 URL"
+owner_repo="$(sed -E 's#^(https://github\.com/|git@github\.com:)##; s#\.git$##' <<<"$remote_url")"
+
+public=0
+for r in "${PUBLIC_REPOS[@]}"; do
+  [[ "$owner_repo" == "$r" ]] && { public=1; break; }
+done
+(( public )) || reject "$owner_repo 不在公开仓白名单内（${PUBLIC_REPOS[*]}）"
+
+default_branch="$("$REAL_GIT" ls-remote --symref "$remote" HEAD 2>/dev/null \
+  | sed -n 's#^ref: refs/heads/\(.*\)\tHEAD#\1#p')"
+[[ -n "$default_branch" ]] || reject "无法确定 $remote 的默认分支，闸门无法判定推送范围"
+
+"$REAL_GIT" fetch --quiet "$remote" "refs/heads/$default_branch" \
+  || reject "拉取 $remote/$default_branch 失败，无法判定推送范围"
+base_sha="$("$REAL_GIT" rev-parse FETCH_HEAD)"
+
+local_ref="${refspec%%:*}"
+[[ -n "$local_ref" ]] || local_ref=HEAD
+head_sha="$("$REAL_GIT" rev-parse "$local_ref" 2>/dev/null || true)"
+[[ -n "$head_sha" ]] || reject "无法解析待推送的本地提交 $local_ref"
+
+mapfile -t commits < <("$REAL_GIT" rev-list "$base_sha..$head_sha")
+n="${#commits[@]}"
+(( n > 0 )) || { exec "$REAL_GIT" "${orig_args[@]}"; }
+(( n <= MAX_COMMITS )) || reject "单次推送提交数 $n 超过上限 $MAX_COMMITS"
+
+mapfile -t files < <("$REAL_GIT" diff --name-only "$base_sha" "$head_sha")
+bad_files=()
+for f in "${files[@]}"; do
+  [[ -z "$f" ]] && continue
+  ok=0
+  for pat in "${ALLOW_PATHS[@]}"; do
+    case "$f" in
+      "$pat"|"$pat"/*) ok=1; break ;;
+    esac
+  done
+  (( ok )) || bad_files+=("$f")
+done
+if (( ${#bad_files[@]} > 0 )); then
+  reject "以下文件不在开源面路径白名单内：$(printf '%s, ' "${bad_files[@]}")"
+fi
+
+if [[ -x "$SCAN_SCRIPT" ]]; then
+  "$SCAN_SCRIPT" "$base_sha" "$head_sha" >&2 || reject "密钥扫描未通过（见上方输出）"
+else
+  reject "找不到密钥扫描脚本：$SCAN_SCRIPT"
+fi
+
+if [[ -z "$TERMS_FILE" || ! -r "$TERMS_FILE" ]]; then
+  reject "未设置/找不到商业术语清单（CLAUDE_PUB_BUSINESS_TERMS），按文档 §9 默认拒绝放行"
+fi
+msgs="$("$REAL_GIT" log --format=%B "$base_sha..$head_sha")"
+diff_add="$("$REAL_GIT" diff --unified=0 "$base_sha" "$head_sha" | grep '^+' | grep -v '^+++' || true)"
+hits="$(printf '%s\n%s\n' "$msgs" "$diff_add" \
+  | grep -Fiof <(grep -vE '^\s*(#|$)' "$TERMS_FILE") 2>/dev/null | sort -u || true)"
+[[ -z "$hits" ]] || reject "提交信息或 diff 命中商业术语清单：$(tr '\n' ' ' <<<"$hits")"
+
+exec < /dev/tty || reject "无 tty，无人值守场景不允许自动通过闸门"
+{
+  printf '推向: %s  分支: %s\n' "$owner_repo" "$remote_branch"
+  printf '提交: %s\n' "$n"
+  "$REAL_GIT" log --format='  %h %s' "$base_sha..$head_sha"
+  printf '文件: %s（全部在白名单内）\n' "${#files[@]}"
+  printf '  %s\n' "${files[@]}"
+  printf '扫描: 密钥 ✅   商业术语 ✅   路径白名单 ✅\n'
+} >&2
+read -r -p '[yes/no]: ' ans
+[[ "$ans" == yes ]] || reject "人工未核准"
+
+exec "$REAL_GIT" "${orig_args[@]}"

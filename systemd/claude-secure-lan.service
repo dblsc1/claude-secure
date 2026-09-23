@@ -1,0 +1,10 @@
+[Unit]
+Description=Claude Secure LAN-only relay
+
+[Service]
+Type=simple
+ExecStart=%h/.local/libexec/claude-secure-lan-relay.py
+Restart=on-failure
+
+[Install]
+WantedBy=default.target

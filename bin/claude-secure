@@ -1,0 +1,441 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ── 配置 ──────────────────────────────────────────────────────────────
+# 环境相关的值（工作区路径、GitHub 账号、公开仓白名单…）全部放在配置文件里，
+# 仓库里只留默认值。见 config.env.example。
+CS_CONFIG="${CLAUDE_SECURE_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/claude-secure/config.env}"
+# shellcheck source=/dev/null
+[[ -r "$CS_CONFIG" ]] && . "$CS_CONFIG"
+user_home="$HOME"
+user_name="$(id -un)"
+cs_workspace="${CS_WORKSPACE:-$HOME/workspace}"
+cs_pub_dir="${CS_PUB_DIR:-public-work}"
+cs_pub_hidden="${CS_PUB_HIDDEN:-}"
+cs_gh_user="${CS_GH_USER:-$user_name}"
+cs_git_name="${CS_GIT_NAME:-$cs_gh_user}"
+cs_git_email="${CS_GIT_EMAIL:-$cs_gh_user@users.noreply.github.com}"
+cs_gh_org="${CS_GH_ORG:-}"
+cs_public_repos="${CS_PUBLIC_REPOS:-}"
+cs_proxy_port="${CS_PROXY_PORT:-7894}"
+cs_lan_proxy_port="${CS_LAN_PROXY_PORT:-7895}"
+cs_tz="${CS_TZ:-UTC}"
+cs_scan_script="${CS_SCAN_SCRIPT:-}"
+cs_business_terms="${CS_BUSINESS_TERMS:-$HOME/.local/share/claude-secure/secrets/business-terms.txt}"
+
+readonly secure_root="$user_home/.local/share/claude-secure"
+readonly secure_home="$secure_root/home"
+readonly user_id="$(id -u)"
+readonly runtime_root="${XDG_RUNTIME_DIR:-/run/user/$user_id}"
+readonly proxy_socket_dir="$runtime_root/claude-secure"
+readonly proxy_socket="$proxy_socket_dir/mihomo.sock"
+readonly claude_binary="$(readlink -f $user_home/.local/bin/claude)"
+readonly libexec_dir="$(cd "$(dirname "$(readlink -f "$0")")/../libexec" && pwd)"
+readonly bridge_script="$libexec_dir/claude-secure-net-bridge.py"
+readonly claude_tmp="/tmp/claude-$user_id"
+readonly daemon_tmp="/tmp/cc-daemon-$user_id"
+
+# ---- 身份与凭据（沙箱与凭据隔离-需求文档.md §1/§2/§8）--------------------
+# 默认 pri：现状就是"全部私有仓可读写"，只是换掉之前落盘的全权 gho_ 令牌。
+# pub 是单独、少用的"把指名提交 cherry-pick 到公开仓"身份，见 claude-pub。
+readonly identity="${CLAUDE_SECURE_IDENTITY:-pri}"
+case "$identity" in
+  pri|pub) ;;
+  *) printf 'Unknown CLAUDE_SECURE_IDENTITY: %s (use pri|pub)\n' "$identity" >&2; exit 1 ;;
+esac
+readonly cred_dir="$secure_root/credentials"
+readonly personal_token="$cred_dir/$identity-personal.token"
+readonly org_token="$cred_dir/$identity-org.token"
+for _t in "$personal_token" "$org_token"; do
+  [[ -r "$_t" ]] || { printf 'Missing credential file: %s\n' "$_t" >&2; exit 1; }
+done
+unset _t
+if [[ "$identity" == pub ]]; then
+  identity_home="$secure_root/home-pub"
+else
+  identity_home="$secure_home"
+fi
+readonly identity_home
+install -d -m 0700 "$identity_home"
+
+# 每次启动都重写：绝不允许上一轮或别的身份的令牌残留在 hosts.yml/.gitconfig 里。
+# gh CLI 每个 host 只认一个 active token，这里用 personal 令牌（§6 验收测试也只测
+# personal 侧的 gh api）；org 仓的 git push/pull 走下面按 URL owner 路由的
+# credential helper，不依赖 hosts.yml——这是已知的 gh CLI 局限，不是漏洞：org 仓
+# 上 gh api 会用错 token 而 403/404，安全方向没错，只是 gh 对 org 不好使。
+install -d -m 0700 "$identity_home/.config/gh"
+personal_tok_val="$(cat "$personal_token")"
+cat >"$identity_home/.config/gh/hosts.yml" <<EOF
+github.com:
+    git_protocol: https
+    users:
+        $cs_gh_user:
+            oauth_token: $personal_tok_val
+    user: $cs_gh_user
+    oauth_token: $personal_tok_val
+EOF
+chmod 600 "$identity_home/.config/gh/hosts.yml"
+unset personal_tok_val
+
+cat >"$identity_home/.gitconfig" <<EOF
+[credential "https://github.com"]
+	helper =
+	helper = /opt/claude/git-credential-identity
+	useHttpPath = true
+[user]
+	name = $cs_git_name
+	email = $cs_git_email
+[push]
+	default = simple
+EOF
+chmod 600 "$identity_home/.gitconfig"
+
+prepare_shared_dir() {
+  local shared_dir="$1"
+  if [[ -L "$shared_dir" || ( -e "$shared_dir" && ! -d "$shared_dir" ) ]]; then
+    printf 'Unsafe Claude shared path: %s\n' "$shared_dir" >&2
+    exit 1
+  fi
+  if [[ ! -d "$shared_dir" ]]; then
+    install -d -m 0700 "$shared_dir"
+  fi
+  if [[ "$(stat -c %u "$shared_dir")" != "$user_id" ]]; then
+    printf 'Claude shared path has unexpected owner: %s\n' "$shared_dir" >&2
+    exit 1
+  fi
+  chmod 0700 "$shared_dir"
+}
+
+prepare_shared_dir "$claude_tmp"
+prepare_shared_dir "$daemon_tmp"
+# tasks 目录在当前 Claude Code 版本下一直是空的（file-history/jobs/session-env
+# 都有几百条活跃记录，只有它 0 条），大概率是残留的旧绑定；但删掉这行风险
+# 未知，先自愈：每次启动都补上，不管它被什么清掉的。
+install -d -m 0700 $user_home/.claude/tasks
+
+# ---- 每个沙箱独立的 ~/.claude/sessions ----------------------------------
+# Claude Code 把会话状态写到 ~/.claude/sessions/<process.pid>.json，退出时
+# unlink 它。本沙箱用 --unshare-pid --as-pid-1，net-bridge.py 是 PID 1，
+# claude 永远是 PID 2。若把宿主的 ~/.claude/sessions 直接共享给所有沙箱，
+# 每个沙箱都写同一个 2.json：后启动的覆盖先启动的，任一窗口退出还会删掉
+# 别人的记录。后果：restore-agents --capture / ai-workspace save 永远只能
+# 登记到 1 个沙箱会话（2026-09 排查结论）。
+#
+# 解法：每次启动建一个独立目录 ~/.claude/sessions-sandbox/<随机>/，绑到
+# 沙箱内的 ~/.claude/sessions。宿主侧 restore-agents 会同时扫这两层。
+# 沙箱退出后由 EXIT trap 删除该目录。跨会话 ListAgents/SendMessage 在
+# 沙箱里本来就不通（/run/user/<uid> 是私有 tmpfs，peer socket 连不上），
+# 所以这样隔离不损失任何功能。
+readonly sandbox_sessions_root="$user_home/.claude/sessions-sandbox"
+install -d -m 0700 "$sandbox_sessions_root"
+# 清理死沙箱留下的目录。EXIT trap 在注销（systemd TERM 后 KILL）或窗口被硬杀
+# 时不会跑，所以不能只靠它。判活依据：记录里 pidDomain 末尾的 PID 命名空间
+# inode 是否还出现在宿主任一 /proc/<pid>/ns/pid 里。没有 json 的空目录直接删。
+# restore-agents --capture 用同一套判活逻辑，两边要同步改。
+# 判活顺序（2026-09-14 修复一次误删）：
+#   1) 目录里的 .wrapper-pid 是创建它的 claude-secure 进程；还活着就绝不碰。
+#      之前只看"有没有 json"，恢复工作区时 3 个 wrapper 相隔 0.5 秒启动，后来者
+#      把前者刚建好、claude 还没来得及写 2.json 的目录当空目录删了，导致该沙箱
+#      的记录永远落在已删除的目录里，capture 看不见。
+#   2) 没有 .wrapper-pid（旧目录）：有 json 就按 pidDomain 命名空间判活；
+#      没 json 且目录已超过 10 分钟没动才删。
+sweep_dead_sandbox_sessions() {
+  local live_ns dir rec domain ns wpid
+  live_ns="$(for n in /proc/[0-9]*/ns/pid; do readlink "$n" 2>/dev/null; done | sort -u)"
+  for dir in "$sandbox_sessions_root"/*/; do
+    [[ -d "$dir" ]] || continue
+    wpid="$(cat "$dir/.wrapper-pid" 2>/dev/null || true)"
+    if [[ "$wpid" =~ ^[0-9]+$ ]] && kill -0 "$wpid" 2>/dev/null; then continue; fi
+    rec="$(find "$dir" -maxdepth 1 -name '*.json' -print -quit 2>/dev/null)"
+    if [[ -z "$rec" ]]; then
+      [[ -n "$(find "$dir" -maxdepth 0 -mmin +10 2>/dev/null)" ]] && rm -rf -- "$dir"
+      continue
+    fi
+    domain="$(jq -r '.pidDomain // empty' "$rec" 2>/dev/null || true)"
+    ns="${domain##*:pid:}"
+    if [[ -z "$ns" || "$ns" == "$domain" ]]; then continue; fi   # 格式不认识，不动
+    grep -qxF "pid:$ns" <<<"$live_ns" || rm -rf -- "$dir"
+  done
+}
+sweep_dead_sandbox_sessions 2>/dev/null || true
+sandbox_sessions_dir="$(mktemp -d "$sandbox_sessions_root/XXXXXXXX")"
+printf '%s\n' "$$" >"$sandbox_sessions_dir/.wrapper-pid"
+# 记下本沙箱用的启动身份（claude-pri / claude-pub），restore-agents --capture 读它，
+# 恢复时用同一个命令重开；没有这个文件的旧目录按默认 claude 处理。
+printf 'claude-%s\n' "$identity" >"$sandbox_sessions_dir/.launcher"
+cleanup_sandbox_sessions() { rm -rf -- "$sandbox_sessions_dir"; }
+trap cleanup_sandbox_sessions EXIT
+# 终端被关（HUP）或被 kill（TERM）时也要走 EXIT trap；INT 不接管，
+# 让 Ctrl-C 照常由沙箱内的 claude 处理。
+trap 'exit 129' HUP
+trap 'exit 143' TERM
+
+if [[ ! -x "$claude_binary" ]]; then
+  printf 'Claude binary not found: %s\n' "$claude_binary" >&2
+  exit 1
+fi
+
+if [[ ! -S "$proxy_socket" ]]; then
+  systemctl --user start claude-secure-proxy.socket
+fi
+
+if [[ ! -S "$proxy_socket" ]]; then
+  printf 'Claude Secure proxy bridge did not start: %s\n' "$proxy_socket" >&2
+  exit 1
+fi
+lan_socket="$proxy_socket_dir/lan.sock"
+if [[ ! -S "$lan_socket" ]]; then
+  systemctl --user start claude-secure-lan.service 2>/dev/null || true
+fi
+
+docker_mode="${CLAUDE_SECURE_DOCKER_MODE:-}"
+if [[ -z "$docker_mode" && -t 0 && -t 1 ]]; then
+  {
+    printf '\nDocker 访问模式：\n'
+    printf '  1) 放行全量 docker.sock —— 沙箱内代码等于拿到宿主机 root，能逃逸出沙箱\n'
+    printf '  2) rootless podman —— 目前被 Ubuntu AppArmor（unpriv_bwrap 拦 CAP_SYS_ADMIN）挡住，大概率跑不通\n'
+    printf '  3) 不给 docker（默认，最安全）\n'
+  } >&2
+  read -r -p "选择 [1/2/3，回车默认 3]: " docker_mode_choice </dev/tty || docker_mode_choice=3
+  case "$docker_mode_choice" in
+    1) docker_mode=full ;;
+    2) docker_mode=rootless ;;
+    *) docker_mode=none ;;
+  esac
+elif [[ -z "$docker_mode" ]]; then
+  docker_mode=none
+fi
+
+case "$docker_mode" in
+  full|rootless|none) ;;
+  *)
+    printf 'Unknown CLAUDE_SECURE_DOCKER_MODE: %s (use full|rootless|none)\n' "$docker_mode" >&2
+    exit 1
+    ;;
+esac
+
+if [[ "$docker_mode" == rootless ]]; then
+  printf '提示：rootless 模式已知会因 AppArmor 报 "cannot clone: Operation not permitted"，除非已装自定义 apparmor 策略。\n' >&2
+fi
+
+workdir="$PWD"
+case "$workdir" in
+  $cs_workspace/.sys|$cs_workspace/.sys/*|$cs_workspace/lost+found|$cs_workspace/lost+found/*)
+    workdir=$cs_workspace
+    ;;
+  $cs_workspace|$cs_workspace/*) ;;
+  *) workdir=$cs_workspace ;;
+esac
+# pub 沙箱里只挂 $cs_pub_dir（见下面工作区重建循环的保留清单），从别的
+# 目录启动会 chdir 失败。判断条件必须跟那个保留清单同步改。
+if [[ "$identity" == pub ]]; then
+  case "$workdir" in
+    $cs_workspace/$cs_pub_dir|$cs_workspace/$cs_pub_dir/*) ;;
+    *)
+      printf 'claude-pub：%s 对 pub 不可见，工作目录改为 %s\n' "$workdir" "$cs_workspace/$cs_pub_dir" >&2
+      workdir="$cs_workspace/$cs_pub_dir"
+      ;;
+  esac
+fi
+
+mode=claude
+if [[ "${1:-}" == "--shell" ]]; then
+  mode=shell
+  shift
+fi
+
+# /var 的挂法要先探测。2026-09-16 起 waydroid 拉进来的 lxcfs 把 fuse 挂在
+# /var/lib/lxcfs，overlayfs 对含有这种子挂载的 lowerdir 会报
+# "failed to clone lowerpath"（bwrap 显示 Invalid argument），整个沙箱起不来，
+# 恢复的终端窗口一闪就关。探测失败就退回只读绑定 + 几个可写 tmpfs。
+var_mount_args=(--overlay-src /var --tmp-overlay /var)
+if ! bwrap --dev-bind / / --overlay-src /var --tmp-overlay /var true 2>/dev/null; then
+  var_mount_args=(--ro-bind /var /var --tmpfs /var/tmp --tmpfs /var/cache)
+  [[ -d /var/lib/lxcfs ]] && var_mount_args+=(--tmpfs /var/lib/lxcfs)
+fi
+
+bwrap_args=(
+  --die-with-parent
+  --clearenv
+  --unshare-net
+  --unshare-pid
+  --unshare-ipc
+  --unshare-uts
+  --unshare-cgroup
+  --as-pid-1
+  --hostname claude-secure
+  --overlay-src /usr --tmp-overlay /usr
+  --overlay-src /bin --tmp-overlay /bin
+  --overlay-src /lib --tmp-overlay /lib
+  --overlay-src /lib64 --tmp-overlay /lib64
+  --overlay-src /etc --tmp-overlay /etc
+  --ro-bind "$secure_root/etc/timezone" /etc/timezone
+  --dev /dev
+  --dev-bind /dev/fuse /dev/fuse
+  --proc /proc
+  --ro-bind /sys/fs/cgroup /sys/fs/cgroup
+  --tmpfs /tmp
+  --dir "/tmp/claude-$user_id"
+  --bind "$claude_tmp" "/tmp/claude-$user_id"
+  --dir "/tmp/cc-daemon-$user_id"
+  --bind "$daemon_tmp" "/tmp/cc-daemon-$user_id"
+  --dir /run
+  --dir /run/user
+  --dir "/run/user/$(id -u)"
+  --ro-bind "$proxy_socket_dir" /run/claude-secure
+  --dir /home
+  --bind "$identity_home" $user_home
+  --bind $user_home/.claude/history.jsonl $user_home/.claude/history.jsonl
+  --bind $user_home/.claude/projects $user_home/.claude/projects
+  --bind "$sandbox_sessions_dir" $user_home/.claude/sessions
+  --bind $user_home/.claude/tasks $user_home/.claude/tasks
+  --bind $user_home/.claude/file-history $user_home/.claude/file-history
+  --bind $user_home/.claude/jobs $user_home/.claude/jobs
+  --bind $user_home/.claude/shell-snapshots $user_home/.claude/shell-snapshots
+  --bind $user_home/.claude/session-env $user_home/.claude/session-env
+  --ro-bind "$user_home/.claude/settings.$identity.json" $user_home/.claude/settings.json
+  --ro-bind $user_home/.claude/settings.local.json $user_home/.claude/settings.local.json
+  --ro-bind $user_home/.claude/statusline-command.sh $user_home/.claude/statusline-command.sh
+  --ro-bind $user_home/.claude/skills $user_home/.claude/skills
+  --ro-bind $user_home/.claude/plugins $user_home/.claude/plugins
+  --bind $user_home/.claude/daemon $user_home/.claude/daemon
+  --bind $user_home/.claude/daemon.lock $user_home/.claude/daemon.lock
+  --bind $user_home/.claude/daemon.log $user_home/.claude/daemon.log
+  --bind $user_home/.claude/daemon.status.json $user_home/.claude/daemon.status.json
+  --dir /srv
+  --dir "$cs_workspace"
+  --chmod 0555 "$cs_workspace"
+  --tmpfs /etc/mihomo
+  "${var_mount_args[@]}"
+  --dir /opt
+  --dir /opt/claude
+  --ro-bind "$claude_binary" /opt/claude/claude
+  --ro-bind "$bridge_script" /opt/claude/net-bridge.py
+  --dir /opt/claude/credentials
+  --ro-bind "$personal_token" /opt/claude/credentials/personal.token
+  --ro-bind "$org_token" /opt/claude/credentials/org.token
+  --ro-bind "$libexec_dir/claude-secure-git-credential" /opt/claude/git-credential-identity
+  --chdir "$workdir"
+  --setenv HOME "$user_home"
+  --setenv USER "$user_name"
+  --setenv LOGNAME "$user_name"
+  --setenv SHELL /bin/bash
+  --setenv PATH /opt/claude:/usr/local/bin:/usr/bin:/bin
+  --setenv LANG en_US.UTF-8
+  --setenv LC_ALL en_US.UTF-8
+  --setenv TZ "$cs_tz"
+  # 凭据 helper 按 URL owner 路由，owner 名字从这里进沙箱；闸门的白名单同理。
+  --setenv CS_GH_USER "$cs_gh_user"
+  --setenv CS_GH_ORG "$cs_gh_org"
+  --setenv CS_PUBLIC_REPOS "$cs_public_repos"
+  --setenv CS_ALLOW_PATHS "${CS_ALLOW_PATHS:-}"
+  --setenv HTTP_PROXY "http://127.0.0.1:$cs_proxy_port"
+  --setenv HTTPS_PROXY "http://127.0.0.1:$cs_proxy_port"
+  --setenv ALL_PROXY "socks5h://127.0.0.1:$cs_proxy_port"
+  --setenv http_proxy "http://127.0.0.1:$cs_proxy_port"
+  --setenv https_proxy "http://127.0.0.1:$cs_proxy_port"
+  --setenv all_proxy "socks5h://127.0.0.1:$cs_proxy_port"
+  --setenv NO_PROXY localhost,127.0.0.1,::1
+  --setenv no_proxy localhost,127.0.0.1,::1
+  --setenv CLAUDE_CODE_PROXY_RESOLVES_HOSTS 1
+  --setenv NODE_USE_ENV_PROXY 1
+  --setenv PLAYWRIGHT_MCP_PROXY_SERVER "http://127.0.0.1:$cs_proxy_port"
+  --setenv LAN_PROXY "socks5h://127.0.0.1:$cs_lan_proxy_port"
+  --setenv XDG_RUNTIME_DIR "/run/user/$user_id"
+)
+
+if [[ "$docker_mode" == full ]]; then
+  bwrap_args+=(--bind /var/run/docker.sock /run/docker.sock)
+fi
+
+# Reconstruct the workspace one top-level entry at a time. Binding the parent
+# would import Docker/containerd submount metadata from .sys into mountinfo.
+while IFS= read -r -d '' workspace_entry; do
+  workspace_name="${workspace_entry##*/}"
+  case "$workspace_name" in
+    .sys|lost+found) continue ;;
+  esac
+  # pub 只做"把指名提交 cherry-pick 到公开仓"，用保留清单而不是排除清单：
+  # 漏一条只是少个功能，排除清单漏一条就是泄露（需求文档 §3.2）。
+  # 实测教训：原先的排除清单只点名了几个目录，剩下 20 多个私有目录连同里面的
+  # 密钥一起留给了 pub。清单反过来写之后才真正关上。
+  if [[ "$identity" == pub && "$workspace_name" != "$cs_pub_dir" ]]; then
+    continue
+  fi
+
+  if [[ -L "$workspace_entry" ]]; then
+    workspace_target="$(readlink "$workspace_entry")"
+    bwrap_args+=(--symlink "$workspace_target" "$cs_workspace/$workspace_name")
+  else
+    bwrap_args+=(--bind "$workspace_entry" "$cs_workspace/$workspace_name")
+  fi
+done < <(find "$cs_workspace" -mindepth 1 -maxdepth 1 -print0)
+
+# CS_PUB_HIDDEN 里的目录是 $cs_pub_dir 的子目录，不在上面循环的粒度上，
+# 挂在循环之后单独盖掉（bwrap 后挂的赢）。
+if [[ "$identity" == pub && -n "$cs_pub_hidden" ]]; then
+  for _hidden in $cs_pub_hidden; do
+    bwrap_args+=(--tmpfs "$cs_workspace/$cs_pub_dir/$_hidden")
+  done
+  unset _hidden
+fi
+
+if [[ -t 0 ]]; then
+  bwrap_args+=(--setenv TERM "${TERM:-xterm-256color}")
+fi
+
+if [[ -n "${COLORTERM:-}" ]]; then
+  bwrap_args+=(--setenv COLORTERM "$COLORTERM")
+fi
+
+# 需求文档 §2.4 硬要求 3：不转发 ssh-agent 进任何沙箱。git 认证走上面的
+# credential helper（按 URL owner 路由到本身份的细粒度 PAT），不需要 ssh-agent。
+
+# 2026-09-19 仓主决定：拆掉 pub 的推送闸门（等新治理架构）。脚本本身留在
+# ~/.local/libexec/claude-secure-push-gate，只是不再挂进 PATH，要恢复就把下面
+# 这三行取消注释：
+#   --dir /opt/claude-gate
+#   --ro-bind "$libexec_dir/claude-secure-push-gate" /opt/claude-gate/git
+#   --setenv PATH /opt/claude-gate:/opt/claude:/usr/local/bin:/usr/bin:/bin
+# 闸门拆掉后，pub 的边界只剩：令牌白名单（只有那一个公开仓，无 Workflows 权限）、
+# 上面工作区循环的保留清单、公开仓 main 的分支保护、CI 里的 gitleaks。
+if [[ "$identity" == pub ]]; then
+  # 扫描脚本正本在私有目录里，pub 看不到那个目录，单文件 ro-bind 进来，
+  # 推之前可以手动跑 /opt/claude/scan-before-push.sh <base> <head>。
+  scan_src="${CLAUDE_PUB_SCAN_SRC:-$cs_scan_script}"
+  if [[ -r "$scan_src" ]]; then
+    bwrap_args+=(--ro-bind "$scan_src" /opt/claude/scan-before-push.sh)
+  fi
+fi
+
+if [[ "$mode" == shell ]]; then
+  payload=(/bin/bash --noprofile --rcfile $user_home/.bashrc -i)
+else
+  payload=(/opt/claude/claude "$@")
+fi
+
+bwrap_bin=bwrap
+if [[ "$docker_mode" == rootless ]]; then
+  bwrap_bin="$libexec_dir/claude-secure-bwrap"
+  if [[ ! -x "$bwrap_bin" ]]; then
+    printf 'rootless mode needs %s (see claude-secure-bwrap AppArmor setup)\n' "$bwrap_bin" >&2
+    exit 1
+  fi
+  # newuidmap/newgidmap are setuid helpers; bwrap forces no_new_privs so
+  # setuid never takes effect inside the sandbox. Mask them so podman's
+  # LookPath fails to find them and falls back to a direct single-uid
+  # mapping instead of trying (and failing) to exec them.
+  bwrap_args+=(
+    --bind /dev/null /usr/bin/newuidmap
+    --bind /dev/null /usr/bin/newgidmap
+    --bind /dev/null /bin/newuidmap
+    --bind /dev/null /bin/newgidmap
+    --bind /dev/null /etc/subuid
+    --bind /dev/null /etc/subgid
+  )
+fi
+
+# 不用 exec：bash 要留在前台等 bwrap 结束，才能跑 EXIT trap 清理
+# sandbox_sessions_dir。退出码原样透传。
+"$bwrap_bin" "${bwrap_args[@]}" \
+  /usr/bin/python3 /opt/claude/net-bridge.py -- "${payload[@]}" || exit "$?"
